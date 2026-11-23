@@ -48,7 +48,11 @@ func (dm *DMap) deleteFromFragment(key string, kind partitions.Kind) error {
 	f.Lock()
 	defer f.Unlock()
 
-	return f.storage.Delete(hkey)
+	err = f.storage.Delete(hkey)
+	if err == nil && kind == partitions.PRIMARY {
+		dm.s.expirations.remove(dm, hkey)
+	}
+	return err
 }
 
 func (dm *DMap) deleteFromPreviousOwners(key string, owners []discovery.Member) error {
@@ -134,6 +138,7 @@ func (dm *DMap) deleteExpiredKey(hkey uint64, key string, f *fragment) (bool, er
 		return false, err
 	}
 
+	dm.s.expirations.remove(dm, hkey)
 	DeleteHits.Increase(1)
 
 	return true, nil
@@ -161,6 +166,8 @@ func (dm *DMap) deleteOnCluster(hkey uint64, key string, f *fragment) error {
 	if err != nil {
 		return err
 	}
+
+	dm.s.expirations.remove(dm, hkey)
 
 	// DeleteHits is the number of deletion reqs resulting in an item being removed.
 	DeleteHits.Increase(1)

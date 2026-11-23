@@ -55,7 +55,11 @@ type Service struct {
 	locker  *locker.Locker
 	dmaps   map[string]*DMap
 	storage *storageMap
-	wg      sync.WaitGroup
+	// expirations tracks the next expiry time for every key written with a TTL.
+	// It lets the reclaimer wake at the deadline instead of repeatedly scanning
+	// all partitions.
+	expirations *expirationQueue
+	wg          sync.WaitGroup
 	// async backup writes in flight; Shutdown waits for them before cancelling ctx.
 	pendingBackups atomic.Int64
 	ctx            context.Context
@@ -89,9 +93,10 @@ func NewService(e *environment.Environment) (service.Service, error) {
 			engines: make(map[string]storage.Engine),
 			configs: make(map[string]map[string]interface{}),
 		},
-		dmaps:  make(map[string]*DMap),
-		ctx:    ctx,
-		cancel: cancel,
+		expirations: newExpirationQueue(),
+		dmaps:       make(map[string]*DMap),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	registerErrors()
 	s.RegisterHandlers()
@@ -134,6 +139,9 @@ func (s *Service) publishEvent(e events.Event) {
 
 // Start starts the distributed map service.
 func (s *Service) Start() error {
+	s.wg.Add(1)
+	go s.expireKeysAtBackground()
+
 	s.wg.Add(1)
 	go s.janitorWorker()
 

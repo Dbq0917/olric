@@ -328,15 +328,25 @@ func TestDMap_Eviction_DoesNotDeleteKeyRevivedDuringClusterDelete(t *testing.T) 
 
 	ctx := context.Background()
 	key := testutil.ToKey(1)
-	require.NoError(t, dm.Put(ctx, key, testutil.ToVal(1), &PutConfig{HasEX: true, EX: time.Millisecond}))
 
 	hkey := partitions.HKey(dm.name, key)
 	part := dm.getPartitionByHKey(hkey, partitions.PRIMARY)
-	f, err := dm.loadFragment(part)
+	f, err := dm.loadOrCreateFragment(part)
 	require.NoError(t, err)
 
-	// The scan would mark it dead here.
-	<-time.After(10 * time.Millisecond)
+	// Insert an already expired entry directly. Using DMap.Put would register
+	// the key with the expiration worker, which could remove it before the test
+	// gets a chance to drive deleteExpiredKey with a stale decision.
+	entry := f.storage.NewEntry()
+	entry.SetKey(key)
+	entry.SetValue(testutil.ToVal(1))
+	entry.SetTTL(time.Now().Add(-time.Second).UnixMilli())
+	entry.SetTimestamp(time.Now().UnixNano())
+	f.Lock()
+	err = f.storage.Put(hkey, entry)
+	f.Unlock()
+	require.NoError(t, err)
+
 	ttl, err := f.storage.GetTTL(hkey)
 	require.NoError(t, err)
 	require.True(t, isKeyExpired(ttl), "key should be expired at the point eviction picks it")

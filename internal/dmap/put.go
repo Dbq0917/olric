@@ -74,6 +74,7 @@ func (dm *DMap) putEntryOnFragment(e *env, nt storage.Entry) error {
 			}
 			return err
 		}
+		dm.s.scheduleExpiration(dm, e.hkey, nt.TTL())
 		return nil
 	}
 	err := e.fragment.storage.Put(e.hkey, nt)
@@ -86,6 +87,8 @@ func (dm *DMap) putEntryOnFragment(e *env, nt storage.Entry) error {
 	if err != nil {
 		return err
 	}
+
+	dm.s.scheduleExpiration(dm, e.hkey, nt.TTL())
 
 	// total number of entries stored during the life of this instance.
 	EntriesTotal.Increase(1)

@@ -225,7 +225,7 @@ func TestDMap_LockWithTimeout_ErrLockNotAcquired_Cluster(t *testing.T) {
 	ctx := context.Background()
 	for i := 0; i < 100; i++ {
 		key := "lock.test.foo." + strconv.Itoa(i)
-		_, err := dm.Lock(ctx, key, time.Second, time.Second)
+		_, err := dm.Lock(ctx, key, time.Minute, time.Second)
 		require.NoError(t, err)
 	}
 

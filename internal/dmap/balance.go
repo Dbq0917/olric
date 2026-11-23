@@ -65,7 +65,16 @@ func (dm *DMap) mergeFragments(part *partitions.Partition, fp *fragmentPack) err
 	defer f.Unlock()
 
 	return f.storage.Import(fp.Payload, func(hkey uint64, entry storage.Entry) error {
-		return dm.fragmentMergeFunction(f, hkey, entry)
+		if err := dm.fragmentMergeFunction(f, hkey, entry); err != nil {
+			return err
+		}
+		if part.Kind() == partitions.PRIMARY {
+			ttl, err := f.storage.GetTTL(hkey)
+			if err == nil {
+				dm.s.scheduleExpiration(dm, hkey, ttl)
+			}
+		}
+		return nil
 	})
 }
 
