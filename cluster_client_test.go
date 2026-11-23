@@ -101,6 +101,60 @@ func TestClusterClient_RoutingTable_Cluster(t *testing.T) {
 	require.Len(t, rt, int(db.config.PartitionCount))
 }
 
+func TestClusterClient_RoutingTable_RefreshOnClusterEvents(t *testing.T) {
+	newConfig := func() *config.Config {
+		c := testutil.NewConfig()
+		c.EnableClusterEventsChannel = true
+		return c
+	}
+
+	cluster := newTestOlricCluster(t)
+	cluster.addMemberWithConfig(t, newConfig())
+	db := cluster.addMemberWithConfig(t, newConfig())
+
+	ctx := context.Background()
+	// Set a long fetch interval to make sure that the test only relies on cluster events.
+	c, err := NewClusterClient([]string{db.name}, WithRoutingTableFetchInterval(time.Hour))
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, c.Close(ctx))
+	}()
+
+	dm, err := c.NewDMap("mydmap")
+	require.NoError(t, err)
+
+	for i := 0; i < 100; i++ {
+		err = dm.Put(ctx, testutil.ToKey(i), "myvalue")
+		require.NoError(t, err)
+	}
+
+	// Scale out the cluster while the client holds a stale routing table.
+	db3 := cluster.addMemberWithConfig(t, newConfig())
+
+	// The client is expected to refresh its routing table without being restarted.
+	require.Eventually(t, func() bool {
+		raw := c.routingTable.Load()
+		if raw == nil {
+			return false
+		}
+		owners := make(map[string]struct{})
+		for _, route := range raw.(RoutingTable) {
+			if len(route.PrimaryOwners) == 0 {
+				continue
+			}
+			owners[route.PrimaryOwners[len(route.PrimaryOwners)-1]] = struct{}{}
+		}
+		_, ok := owners[db3.rt.This().String()]
+		return ok && len(owners) == 3
+	}, 30*time.Second, 100*time.Millisecond)
+
+	// All keys are still accessible after the scale-out.
+	for i := 0; i < 100; i++ {
+		_, err = dm.Get(ctx, testutil.ToKey(i))
+		require.NoError(t, err)
+	}
+}
+
 func TestClusterClient_Put(t *testing.T) {
 	cluster := newTestOlricCluster(t)
 	db := cluster.addMember(t)

@@ -307,6 +307,10 @@ Olric can send push cluster events to `cluster.events` channel. Available cluste
 If you want to receive these events, set `true` to `EnableClusterEventsChannel` and subscribe to `cluster.events` channel. 
 The default is `false`.
 
+`ClusterClient` subscribes to this channel automatically and refreshes its cached routing table whenever the cluster
+topology changes, so it can follow scale-out and scale-in events without being restarted. If the channel is disabled
+on the servers, `ClusterClient` falls back to refreshing its routing table periodically. See `RoutingTableFetchInterval`.
+
 See the [events/cluster_events.go](events/cluster_events.go) file to get more information about events.
 
 ## Authentication

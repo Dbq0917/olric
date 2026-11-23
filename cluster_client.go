@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/olric-data/olric/config"
+	"github.com/olric-data/olric/events"
 	"github.com/olric-data/olric/hasher"
 	"github.com/olric-data/olric/internal/bufpool"
 	"github.com/olric-data/olric/internal/cluster/partitions"
@@ -47,6 +48,21 @@ var pool = bufpool.New()
 // DefaultRoutingTableFetchInterval is the default value of RoutingTableFetchInterval. ClusterClient implementation
 // fetches the routing table from the cluster to route requests to the right partition.
 const DefaultRoutingTableFetchInterval = time.Minute
+
+const (
+	// clusterEventsRefreshDebounce is the quiet period after the last received cluster event before the
+	// cached routing table is refreshed. Cluster topology changes, such as rebalancing after a node join,
+	// produce a burst of events and a single refresh is enough once the burst settles.
+	clusterEventsRefreshDebounce = 250 * time.Millisecond
+
+	// clusterEventsRefreshMaxDelay caps how long a continuous stream of cluster events can postpone
+	// a routing table refresh.
+	clusterEventsRefreshMaxDelay = 2 * time.Second
+
+	// clusterEventsRetryInterval is the wait before re-subscribing to the cluster events channel
+	// after the subscription has been interrupted.
+	clusterEventsRetryInterval = time.Second
+)
 
 type ClusterLockContext struct {
 	key   string
@@ -570,6 +586,7 @@ type ClusterClient struct {
 	logger         *log.Logger
 	routingTable   atomic.Value
 	partitionCount uint64
+	refreshCh      chan struct{}
 	wg             sync.WaitGroup
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -600,27 +617,38 @@ func (cl *ClusterClient) Ping(ctx context.Context, addr, message string) (string
 
 // RoutingTable returns the latest version of the routing table.
 func (cl *ClusterClient) RoutingTable(ctx context.Context) (RoutingTable, error) {
-	cmd := protocol.NewClusterRoutingTable().Command(ctx)
-	rc, err := cl.client.Pick()
-	if err != nil {
-		return RoutingTable{}, err
-	}
+	// The client may keep stale members in its connection pool. Try the members one by one
+	// until one of them responds. A single unresponsive member should not prevent fetching
+	// the routing table.
+	var lastErr error
+	addresses := cl.client.Addresses()
+	for i := 0; i < len(addresses); i++ {
+		rc, err := cl.client.Pick()
+		if err != nil {
+			return RoutingTable{}, err
+		}
 
-	err = rc.Process(ctx, cmd)
-	if err != nil {
-		return RoutingTable{}, processProtocolError(err)
-	}
+		cmd := protocol.NewClusterRoutingTable().Command(ctx)
+		if err = rc.Process(ctx, cmd); err != nil {
+			lastErr = processProtocolError(err)
+			continue
+		}
+		if err = cmd.Err(); err != nil {
+			lastErr = processProtocolError(err)
+			continue
+		}
 
-	if err = cmd.Err(); err != nil {
-		return RoutingTable{}, processProtocolError(err)
+		result, err := cmd.Slice()
+		if err != nil {
+			lastErr = processProtocolError(err)
+			continue
+		}
+		return mapToRoutingTable(result)
 	}
-
-	result, err := cmd.Slice()
-	if err != nil {
-		return RoutingTable{}, processProtocolError(err)
-
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available member found to fetch the routing table")
 	}
-	return mapToRoutingTable(result)
+	return RoutingTable{}, lastErr
 }
 
 // Stats returns stats.Stats with the given options.
@@ -746,6 +774,8 @@ func (cl *ClusterClient) Close(ctx context.Context) error {
 
 	// Wait for the background workers:
 	// * fetchRoutingTablePeriodically
+	// * listenClusterEvents
+	// * routingTableRefresher
 	cl.wg.Wait()
 
 	// Close the underlying TCP sockets gracefully.
@@ -868,6 +898,138 @@ func (cl *ClusterClient) fetchRoutingTablePeriodically() {
 	}
 }
 
+// requestRoutingTableRefresh signals the routingTableRefresher to refresh the cached routing table.
+// It's non-blocking and safe to call concurrently. Pending signals coalesce into a single refresh.
+func (cl *ClusterClient) requestRoutingTableRefresh() {
+	select {
+	case cl.refreshCh <- struct{}{}:
+	default:
+	}
+}
+
+// routingTableRefresher refreshes the cached routing table in response to cluster events. Refreshes are
+// debounced: a burst of events, such as fragment migrations during a rebalance, results in a single refresh
+// once the burst settles, and a continuous stream of events cannot postpone a refresh for longer than
+// clusterEventsRefreshMaxDelay.
+func (cl *ClusterClient) routingTableRefresher() {
+	defer cl.wg.Done()
+
+	var (
+		debounce   *time.Timer
+		debounceCh <-chan time.Time
+		maxDelay   *time.Timer
+		maxDelayCh <-chan time.Time
+	)
+	stopTimers := func() {
+		if debounce != nil {
+			debounce.Stop()
+			debounce = nil
+			debounceCh = nil
+		}
+		if maxDelay != nil {
+			maxDelay.Stop()
+			maxDelay = nil
+			maxDelayCh = nil
+		}
+	}
+	refresh := func() {
+		if err := cl.fetchRoutingTable(); err != nil {
+			cl.logger.Printf("[ERROR] Failed to fetch the latest version of the routing table: %s", err)
+		}
+	}
+
+	for {
+		select {
+		case <-cl.ctx.Done():
+			stopTimers()
+			return
+		case <-cl.refreshCh:
+			if debounce == nil {
+				debounce = time.NewTimer(clusterEventsRefreshDebounce)
+			} else {
+				debounce.Reset(clusterEventsRefreshDebounce)
+			}
+			debounceCh = debounce.C
+			if maxDelay == nil {
+				maxDelay = time.NewTimer(clusterEventsRefreshMaxDelay)
+				maxDelayCh = maxDelay.C
+			}
+		case <-debounceCh:
+			stopTimers()
+			refresh()
+		case <-maxDelayCh:
+			stopTimers()
+			refresh()
+		}
+	}
+}
+
+// listenClusterEvents subscribes to the cluster events channel and triggers a refresh of the cached
+// routing table whenever the cluster topology changes. The subscription is re-established if it's
+// interrupted, e.g. when the subscribed member goes down. Note that cluster members only publish
+// these events if EnableClusterEventsChannel is set in their configuration. The periodic fetcher
+// keeps running as a fallback.
+func (cl *ClusterClient) listenClusterEvents() {
+	defer cl.wg.Done()
+
+	for {
+		err := cl.subscribeClusterEvents()
+		if cl.ctx.Err() != nil {
+			return
+		}
+		cl.logger.Printf("[ERROR] Cluster events subscription has been terminated: %v. Retrying in %s",
+			err, clusterEventsRetryInterval)
+		select {
+		case <-cl.ctx.Done():
+			return
+		case <-time.After(clusterEventsRetryInterval):
+		}
+	}
+}
+
+// subscribeClusterEvents subscribes to the cluster events channel on one of the known members and
+// signals a routing table refresh for every received event. It returns when the subscription breaks
+// or the client is closed.
+func (cl *ClusterClient) subscribeClusterEvents() error {
+	ps, err := cl.NewPubSub()
+	if err != nil {
+		return err
+	}
+	sub := ps.Subscribe(cl.ctx, events.ClusterEventsChannel)
+	defer func() {
+		_ = sub.Close()
+	}()
+
+	// ReceiveMessage ignores the context while waiting for a message. Close the subscription
+	// explicitly to unblock it when the client is closed.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-cl.ctx.Done():
+			_ = sub.Close()
+		case <-done:
+		}
+	}()
+
+	// Wait for the subscription confirmation.
+	if _, err := sub.Receive(cl.ctx); err != nil {
+		return err
+	}
+
+	// Events may have been missed while (re)subscribing.
+	cl.requestRoutingTableRefresh()
+
+	for {
+		// ReceiveMessage blocks until a message arrives, the connection breaks or cl.ctx is canceled.
+		if _, err := sub.ReceiveMessage(cl.ctx); err != nil {
+			return err
+		}
+		// Any event on this channel means that the cluster topology may have changed.
+		cl.requestRoutingTableRefresh()
+	}
+}
+
 // NewClusterClient creates a new Client instance. It needs one node address at least to discover the whole cluster.
 func NewClusterClient(addresses []string, options ...ClusterClientOption) (*ClusterClient, error) {
 	if len(addresses) == 0 {
@@ -908,11 +1070,12 @@ func NewClusterClient(addresses []string, options ...ClusterClientOption) (*Clus
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cl := &ClusterClient{
-		client: server.NewClient(cc.config),
-		config: &cc,
-		logger: cc.logger,
-		ctx:    ctx,
-		cancel: cancel,
+		client:    server.NewClient(cc.config),
+		config:    &cc,
+		logger:    cc.logger,
+		refreshCh: make(chan struct{}, 1),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	// Initialize clients for the given cluster members.
@@ -940,6 +1103,11 @@ func NewClusterClient(addresses []string, options ...ClusterClientOption) (*Clus
 	// Refresh the routing table in every 15 seconds.
 	cl.wg.Add(1)
 	go cl.fetchRoutingTablePeriodically()
+
+	// Watch cluster events to refresh the routing table as soon as the cluster topology changes.
+	cl.wg.Add(2)
+	go cl.listenClusterEvents()
+	go cl.routingTableRefresher()
 
 	return cl, nil
 }
