@@ -1087,3 +1087,37 @@ func TestTransferIterator_Export_SkipsRecycledState(t *testing.T) {
 	_, _, err = ti.Export()
 	require.ErrorIs(t, err, io.EOF)
 }
+
+func TestTransferIterator_ID_SkipsRecycledState(t *testing.T) {
+	s := testRamBlock(t, nil)
+	k := s.(*RamBlock)
+
+	timestamp := time.Now().UnixNano()
+	for i := 0; i < 100000; i++ {
+		e := entry.New()
+		e.SetKey(bkey(i))
+		e.SetTTL(int64(i))
+		e.SetValue([]byte(fmt.Sprintf("%01000d", i)))
+		e.SetTimestamp(timestamp)
+		hkey := xxhash.Sum64([]byte(e.Key()))
+		err := s.Put(hkey, e)
+		require.NoError(t, err)
+	}
+	require.Greater(t, len(k.tables), 1)
+
+	k.tables[0].SetState(table.RecycledState)
+
+	ti := s.TransferIterator()
+	id, err := ti.ID()
+	require.NoError(t, err)
+
+	_, index, err := ti.Export()
+	require.NoError(t, err)
+	require.Equal(t, k.tables[index].Coefficient(), id)
+
+	for _, tb := range k.tables {
+		tb.SetState(table.RecycledState)
+	}
+	_, err = ti.ID()
+	require.ErrorIs(t, err, io.EOF)
+}

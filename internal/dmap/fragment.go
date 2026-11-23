@@ -74,27 +74,47 @@ func (f *fragment) Name() string {
 }
 
 func (f *fragment) Move(part *partitions.Partition, name string, owners []discovery.Member) error {
-	f.Lock()
-	defer f.Unlock()
+	var value []byte
+	var index int
+	var tableID uint64
+	var moveErr error
 
-	i := f.storage.TransferIterator()
-	if !i.Next() {
+	func() {
+		f.Lock()
+		defer f.Unlock()
+
+		i := f.storage.TransferIterator()
+		if !i.Next() {
+			return
+		}
+
+		payload, nextIndex, err := i.Export()
+		if err != nil {
+			moveErr = err
+			return
+		}
+		index = nextIndex
+		tableID, err = i.ID()
+		if err != nil {
+			moveErr = err
+			return
+		}
+		fp := &fragmentPack{
+			PartID:  part.ID(),
+			Kind:    part.Kind(),
+			Name:    strings.TrimPrefix(name, "dmap."),
+			Payload: payload,
+		}
+		value, err = msgpack.Marshal(fp)
+		if err != nil {
+			moveErr = err
+		}
+	}()
+	if moveErr != nil {
+		return moveErr
+	}
+	if value == nil {
 		return nil
-	}
-
-	payload, index, err := i.Export()
-	if err != nil {
-		return err
-	}
-	fp := &fragmentPack{
-		PartID:  part.ID(),
-		Kind:    part.Kind(),
-		Name:    strings.TrimPrefix(name, "dmap."),
-		Payload: payload,
-	}
-	value, err := msgpack.Marshal(fp)
-	if err != nil {
-		return err
 	}
 
 	for _, owner := range owners {
@@ -105,7 +125,7 @@ func (f *fragment) Move(part *partitions.Partition, name string, owners []discov
 				Target:        owner.String(),
 				DataStructure: "dmap",
 				PartitionID:   part.ID(),
-				Identifier:    fp.Name,
+				Identifier:    strings.TrimPrefix(name, "dmap."),
 				Length:        len(value),
 				IsBackup:      part.Kind() == partitions.BACKUP,
 				Timestamp:     time.Now().UnixNano(),
@@ -116,7 +136,7 @@ func (f *fragment) Move(part *partitions.Partition, name string, owners []discov
 
 		cmd := protocol.NewMoveFragment(value).Command(f.service.ctx)
 		rc := f.service.client.Get(owner.String())
-		err = rc.Process(f.service.ctx, cmd)
+		err := rc.Process(f.service.ctx, cmd)
 		if err != nil {
 			return err
 		}
@@ -125,6 +145,24 @@ func (f *fragment) Move(part *partitions.Partition, name string, owners []discov
 		}
 	}
 
+	f.Lock()
+	defer f.Unlock()
+
+	i := f.storage.TransferIterator()
+	if !i.Next() {
+		return nil
+	}
+	_, currentIndex, err := i.Export()
+	if err != nil {
+		return err
+	}
+	currentTableID, err := i.ID()
+	if err != nil {
+		return err
+	}
+	if currentIndex != index || currentTableID != tableID {
+		return nil
+	}
 	return i.Drop(index)
 }
 

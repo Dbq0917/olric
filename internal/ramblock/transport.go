@@ -30,6 +30,16 @@ func (t *transferIterator) Next() bool {
 	return len(t.storage.tables) != 0
 }
 
+func (t *transferIterator) ID() (uint64, error) {
+	for _, tb := range t.storage.tables {
+		if tb.State() == table.RecycledState {
+			continue
+		}
+		return tb.Coefficient(), nil
+	}
+	return 0, io.EOF
+}
+
 func (t *transferIterator) Drop(index int) error {
 	if len(t.storage.tables) == 0 {
 		return fmt.Errorf("there is no table to drop")

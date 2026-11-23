@@ -40,6 +40,9 @@ type TransferIterator interface {
 	// Otherwise, it returns false.
 	Next() bool
 
+	// ID returns a stable identifier for the table that Export will return next.
+	ID() (uint64, error)
+
 	// Export encodes a table and returns result. This encoded table can be moved to another Olric node.
 	Export() ([]byte, int, error)
 

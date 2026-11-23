@@ -16,12 +16,19 @@ package dmap
 
 import (
 	"errors"
+	"net"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/olric-data/olric/internal/cluster/partitions"
+	"github.com/olric-data/olric/internal/discovery"
+	"github.com/olric-data/olric/internal/protocol"
 	"github.com/olric-data/olric/internal/testcluster"
 	"github.com/olric-data/olric/internal/testutil"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/redcon"
 )
 
 func TestDMap_Fragment(t *testing.T) {
@@ -119,5 +126,80 @@ func TestDMap_Fragment_Concurrent_Access(t *testing.T) {
 		if entry.Key() != testutil.ToKey(i) {
 			t.Fatalf("Expected key: %s. Got: %s", testutil.ToKey(i), entry.Key())
 		}
+	}
+}
+
+func TestDMap_Fragment_MoveDoesNotBlockReadsDuringNetworkTransfer(t *testing.T) {
+	cluster := testcluster.New(NewService)
+	s := cluster.AddMember(nil).(*Service)
+	defer cluster.Shutdown()
+
+	dm, err := s.NewDMap("mydmap")
+	require.NoError(t, err)
+
+	hkey := uint64(123)
+	part := dm.getPartitionByHKey(hkey, partitions.PRIMARY)
+	f, err := dm.loadOrCreateFragment(part)
+	require.NoError(t, err)
+
+	entry := f.storage.NewEntry()
+	entry.SetKey("my-key")
+	entry.SetValue([]byte("my-value"))
+	f.Lock()
+	require.NoError(t, f.storage.Put(hkey, entry))
+	f.Unlock()
+
+	port, err := testutil.GetFreePort()
+	require.NoError(t, err)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	ln, err := net.Listen("tcp", addr)
+	require.NoError(t, err)
+	defer ln.Close()
+
+	received := make(chan struct{})
+	release := make(chan struct{})
+
+	go func() {
+		_ = redcon.Serve(ln, func(conn redcon.Conn, cmd redcon.Command) {
+			if string(cmd.Args[0]) == protocol.Internal.MoveFragment {
+				close(received)
+				<-release
+				conn.WriteString(protocol.StatusOK)
+				return
+			}
+			conn.WriteError("unexpected command")
+		}, nil, nil)
+	}()
+
+	moveErr := make(chan error, 1)
+	go func() {
+		moveErr <- f.Move(part, "dmap.mydmap", []discovery.Member{{Name: addr}})
+	}()
+
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for migration request")
+	}
+
+	readLockAcquired := make(chan struct{})
+	go func() {
+		f.RLock()
+		defer f.RUnlock()
+		close(readLockAcquired)
+	}()
+
+	select {
+	case <-readLockAcquired:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("fragment reads are blocked while migration is in flight")
+	}
+
+	close(release)
+	select {
+	case err := <-moveErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for Move to finish")
 	}
 }
