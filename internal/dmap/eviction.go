@@ -45,7 +45,17 @@ func (dm *DMap) isKeyIdleOnFragment(hkey uint64, f *fragment) bool {
 	if errors.Is(err, storage.ErrKeyNotFound) {
 		return false
 	}
-	//TODO: Handle other errors.
+	if err != nil {
+		// A failed read must never be treated as "never accessed": with a zero
+		// timestamp every key would look ancient and get evicted in one sweep.
+		// Give the key the benefit of the doubt this round and re-check it on
+		// the next eviction cycle. Keys that are genuinely idle are still
+		// evicted, because a later successful read returns their real, stale
+		// last-access timestamp.
+		dm.s.log.V(3).Printf("[ERROR] Failed to get last access for: %d on DMap: %s: %v",
+			hkey, dm.name, err)
+		return false
+	}
 	ttl := (dm.config.maxIdleDuration.Nanoseconds() + lastAccess) / 1000000
 	return isKeyExpired(ttl)
 }
@@ -58,8 +68,12 @@ func (dm *DMap) isKeyIdle(hkey uint64) bool {
 		return false
 	}
 	if err != nil {
-		// This could be a programming error and should never be happened on production systems.
-		panic(fmt.Sprintf("failed to get primary partition for: %d: %v", hkey, err))
+		// Panicking here would take down the whole node over a single routing
+		// hiccup. Skip this key for now: it stays reachable and gets another
+		// idle check on the next eviction/read round.
+		dm.s.log.V(3).Printf("[ERROR] Failed to get primary partition for: %d on DMap: %s: %v",
+			hkey, dm.name, err)
+		return false
 	}
 	f.Lock()
 	defer f.Unlock()
