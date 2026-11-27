@@ -1134,6 +1134,9 @@ partID = MOD(hash result, partition count)
 
 The partitions are being distributed among cluster members by using a consistent hashing algorithm. In order to get details, please see [buraksezer/consistent](https://github.com/buraksezer/consistent). 
 
+`server.replicationFactor` controls how many virtual nodes each cluster member has on the consistent hash ring. It defaults to `20`
+and affects partition ownership. The number of data copies is controlled separately by `server.replicaCount`.
+
 When a new cluster is created, one of the instances is elected as the **cluster coordinator**. It manages the partition table: 
 
 * When a node joins or leaves, it distributes the partitions and their backups among the members again,

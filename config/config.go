@@ -66,6 +66,10 @@ const (
 	// DefaultPartitionCount denotes default partition count in the cluster.
 	DefaultPartitionCount = 271
 
+	// DefaultReplicationFactor denotes the default number of virtual nodes
+	// created for each member on the consistent hash ring.
+	DefaultReplicationFactor = 20
+
 	// DefaultLoadFactor is used by the consistent hashing function. Keep it small.
 	DefaultLoadFactor = 1.25
 
@@ -224,6 +228,12 @@ type Config struct {
 	// PartitionCount is 271, by default.
 	PartitionCount uint64
 
+	// ReplicationFactor is the number of virtual nodes created for each member
+	// on the consistent hash ring. It controls how partitions are distributed
+	// among members. It does not control the number of data copies; use
+	// ReplicaCount for that. Default is 20.
+	ReplicationFactor int
+
 	// ReplicaCount is 1, by default.
 	ReplicaCount int
 
@@ -324,6 +334,10 @@ type Config struct {
 
 // Validate finds errors in the current configuration.
 func (c *Config) Validate() error {
+	if c.ReplicationFactor < 1 {
+		return fmt.Errorf("cannot specify ReplicationFactor smaller than 1")
+	}
+
 	if c.ReplicaCount < MinimumReplicaCount {
 		return fmt.Errorf("cannot specify ReplicaCount smaller than MinimumReplicaCount")
 	}
@@ -428,6 +442,9 @@ func (c *Config) Sanitize() error {
 	}
 	if c.PartitionCount == 0 {
 		c.PartitionCount = DefaultPartitionCount
+	}
+	if c.ReplicationFactor == 0 {
+		c.ReplicationFactor = DefaultReplicationFactor
 	}
 	if c.ReplicaCount == 0 {
 		c.ReplicaCount = MinimumReplicaCount

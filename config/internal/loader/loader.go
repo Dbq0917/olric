@@ -23,6 +23,7 @@ type server struct {
 	Interface                  string  `yaml:"interface"`
 	ReplicationMode            int     `yaml:"replicationMode"`
 	PartitionCount             uint64  `yaml:"partitionCount"`
+	ReplicationFactor          int     `yaml:"replicationFactor"`
 	LoadFactor                 float64 `yaml:"loadFactor"`
 	KeepAlivePeriod            string  `yaml:"keepAlivePeriod"`
 	IdleClose                  string  `yaml:"idleClose"`

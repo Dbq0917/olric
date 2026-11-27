@@ -57,21 +57,23 @@ type RoutingTable struct {
 	// These values is useful to control operation status.
 	bootstrapped int32
 
-	updateRoutingMtx sync.Mutex
-	table            map[uint64]*route
-	consistent       *consistent.Consistent
-	this             discovery.Member
-	members          *Members
-	config           *config.Config
-	log              *flog.Logger
-	primary          *partitions.Partitions
-	backup           *partitions.Partitions
-	client           *server.Client
-	server           *server.Server
-	discovery        *discovery.Discovery
-	callbacks        []func()
-	callbackMtx      sync.Mutex
-	pushPeriod       time.Duration
+	updateRoutingMtx  sync.Mutex
+	table             map[uint64]*route
+	consistent        *consistent.Consistent
+	consistentMtx     sync.RWMutex
+	replicationFactor int
+	this              discovery.Member
+	members           *Members
+	config            *config.Config
+	log               *flog.Logger
+	primary           *partitions.Partitions
+	backup            *partitions.Partitions
+	client            *server.Client
+	server            *server.Server
+	discovery         *discovery.Discovery
+	callbacks         []func()
+	callbackMtx       sync.Mutex
+	pushPeriod        time.Duration
 	// The command handlers of the routing table service should wait for the cluster join event.
 	joined chan struct{}
 	ctx    context.Context
@@ -93,31 +95,79 @@ func New(e *environment.Environment) *RoutingTable {
 	log := e.Get("logger").(*flog.Logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cc := consistent.Config{
-		Hasher:            c.Hasher,
-		PartitionCount:    int(c.PartitionCount),
-		ReplicationFactor: 20, // TODO: This also may be a configuration param.
-		Load:              c.LoadFactor,
-	}
 
 	rt := &RoutingTable{
-		members:    newMembers(),
-		discovery:  discovery.New(log, c),
-		config:     c,
-		log:        log,
-		consistent: consistent.New(nil, cc),
-		primary:    e.Get("primary").(*partitions.Partitions),
-		backup:     e.Get("backup").(*partitions.Partitions),
-		client:     e.Get("client").(*server.Client),
-		server:     e.Get("server").(*server.Server),
-		pushPeriod: c.RoutingTablePushInterval,
-		joined:     make(chan struct{}),
-		ctx:        ctx,
-		cancel:     cancel,
+		members:           newMembers(),
+		discovery:         discovery.New(log, c),
+		config:            c,
+		log:               log,
+		consistent:        newConsistent(c),
+		replicationFactor: c.ReplicationFactor,
+		primary:           e.Get("primary").(*partitions.Partitions),
+		backup:            e.Get("backup").(*partitions.Partitions),
+		client:            e.Get("client").(*server.Client),
+		server:            e.Get("server").(*server.Server),
+		pushPeriod:        c.RoutingTablePushInterval,
+		joined:            make(chan struct{}),
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 	registerErrors()
 	rt.RegisterHandlers()
 	return rt
+}
+
+func newConsistent(c *config.Config) *consistent.Consistent {
+	return consistent.New(nil, consistent.Config{
+		Hasher:            c.Hasher,
+		PartitionCount:    int(c.PartitionCount),
+		ReplicationFactor: c.ReplicationFactor,
+		Load:              c.LoadFactor,
+	})
+}
+
+// reconcileConsistent rebuilds the consistent hash ring when ReplicationFactor
+// changes. The members are kept on the ring, but their virtual node count and
+// therefore the partition ownership are recalculated with the new value.
+func (r *RoutingTable) reconcileConsistent() {
+	r.consistentMtx.Lock()
+	defer r.consistentMtx.Unlock()
+
+	if r.replicationFactor == r.config.ReplicationFactor {
+		return
+	}
+
+	members := r.consistent.GetMembers()
+	ring := newConsistent(r.config)
+	for _, member := range members {
+		ring.Add(member)
+	}
+	r.consistent = ring
+	r.replicationFactor = r.config.ReplicationFactor
+}
+
+func (r *RoutingTable) consistentAdd(member discovery.Member) {
+	r.consistentMtx.RLock()
+	defer r.consistentMtx.RUnlock()
+	r.consistent.Add(member)
+}
+
+func (r *RoutingTable) consistentRemove(name string) {
+	r.consistentMtx.RLock()
+	defer r.consistentMtx.RUnlock()
+	r.consistent.Remove(name)
+}
+
+func (r *RoutingTable) partitionOwner(partID uint64) consistent.Member {
+	r.consistentMtx.RLock()
+	defer r.consistentMtx.RUnlock()
+	return r.consistent.GetPartitionOwner(int(partID))
+}
+
+func (r *RoutingTable) closestNForPartition(partID uint64, n int) ([]consistent.Member, error) {
+	r.consistentMtx.RLock()
+	defer r.consistentMtx.RUnlock()
+	return r.consistent.GetClosestNForPartition(int(partID), n)
 }
 
 func (r *RoutingTable) Discovery() *discovery.Discovery {
@@ -215,6 +265,8 @@ func (r *RoutingTable) CheckBootstrap() error {
 const fillRoutingTableConcurrency = 32
 
 func (r *RoutingTable) fillRoutingTable() {
+	r.reconcileConsistent()
+
 	if r.config.ReplicaCount > int(r.NumMembers()) {
 		r.log.V(1).Printf("[WARN] Desired replica count is %d and "+
 			"the cluster has %d members currently",
@@ -258,6 +310,8 @@ func (r *RoutingTable) updateRouting() {
 	r.Lock()
 	defer r.Unlock()
 
+	r.reconcileConsistent()
+
 	// This function is only run by the cluster coordinator.
 	if !r.discovery.IsCoordinator() {
 		return
@@ -280,6 +334,8 @@ func (r *RoutingTable) updateRouting() {
 }
 
 func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
+	r.reconcileConsistent()
+
 	r.Members().Lock()
 	defer r.Members().Unlock()
 
@@ -288,7 +344,7 @@ func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
 	switch event.Event {
 	case memberlist.NodeJoin:
 		r.Members().Add(member)
-		r.consistent.Add(member)
+		r.consistentAdd(member)
 		r.log.V(2).Printf("[INFO] Node joined: %s", member)
 
 		if r.config.EnableClusterEventsChannel {
@@ -301,7 +357,7 @@ func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
 			return
 		}
 		r.Members().Delete(member.ID)
-		r.consistent.Remove(event.NodeName)
+		r.consistentRemove(event.NodeName)
 		// Don't try to used closed sockets again.
 		r.log.V(2).Printf("[INFO] Node left: %s", event.NodeName)
 		if err := r.client.Close(event.NodeName); err != nil {
@@ -318,7 +374,7 @@ func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
 		r.Members().Range(func(id uint64, item discovery.Member) bool {
 			if member.CompareByName(item) {
 				r.Members().Delete(id)
-				r.consistent.Remove(event.NodeName)
+				r.consistentRemove(event.NodeName)
 				if err := r.client.Close(event.NodeName); err != nil {
 					r.log.V(2).Printf("[ERROR] Failed to remove the node from pool %s: %v", event.NodeName, err)
 				}
@@ -326,7 +382,7 @@ func (r *RoutingTable) processClusterEvent(event *discovery.ClusterEvent) {
 			return true
 		})
 		r.Members().Add(member)
-		r.consistent.Add(member)
+		r.consistentAdd(member)
 		r.log.V(2).Printf("[INFO] Node updated: %s", member)
 	default:
 		r.log.V(2).Printf("[ERROR] Unknown event received: %v", event)
@@ -430,7 +486,7 @@ func (r *RoutingTable) Start() error {
 	r.Members().Add(r.this)
 	r.Members().Unlock()
 
-	r.consistent.Add(r.this)
+	r.consistentAdd(r.this)
 
 	if r.discovery.IsCoordinator() {
 		err = r.bootstrapCoordinator()

@@ -393,6 +393,7 @@ func Load(filename string) (*Config, error) {
 		MaxJoinAttempts:            c.Memberlist.MaxJoinAttempts,
 		Peers:                      c.Memberlist.Peers,
 		PartitionCount:             c.Server.PartitionCount,
+		ReplicationFactor:          c.Server.ReplicationFactor,
 		ReplicaCount:               c.Server.ReplicaCount,
 		WriteQuorum:                c.Server.WriteQuorum,
 		ReadQuorum:                 c.Server.ReadQuorum,

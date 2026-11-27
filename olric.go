@@ -402,6 +402,8 @@ func (db *Olric) Start() error {
 	db.log.V(2).Printf("[INFO] Olric bindAddr: %s, bindPort: %d",
 		db.config.BindAddr, db.config.BindPort)
 	db.log.V(2).Printf("[INFO] Replication count is %d", db.config.ReplicaCount)
+	db.log.V(2).Printf("[INFO] Consistent hashing replication factor is %d",
+		db.config.ReplicationFactor)
 
 	// Wait for the TCP server.
 	return errGr.Wait()

@@ -27,6 +27,11 @@ server:
   # PartitionCount is 271, by default.
   partitionCount: 271
 
+  # ReplicationFactor is the number of virtual nodes created for each member
+  # on the consistent hash ring. It controls partition distribution.
+  # ReplicationFactor is 20, by default.
+  replicationFactor: 20
+
   # ReplicaCount is 1, by default.
   replicaCount: 1
 

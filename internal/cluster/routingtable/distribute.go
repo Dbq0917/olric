@@ -32,7 +32,7 @@ func (r *RoutingTable) distributePrimaryCopies(partID uint64, unreachable *unrea
 	copy(owners, part.Owners())
 
 	// Find the new partition owner.
-	newOwner := r.consistent.GetPartitionOwner(int(partID))
+	newOwner := r.partitionOwner(partID)
 
 	// First run.
 	if len(owners) == 0 {
@@ -89,7 +89,7 @@ func (r *RoutingTable) distributePrimaryCopies(partID uint64, unreachable *unrea
 
 func (r *RoutingTable) getReplicaOwners(partID uint64) ([]consistent.Member, error) {
 	for i := r.config.ReplicaCount; i > 0; i-- {
-		newOwners, err := r.consistent.GetClosestNForPartition(int(partID), i)
+		newOwners, err := r.closestNForPartition(partID, i)
 		if errors.Is(err, consistent.ErrInsufficientMemberCount) {
 			continue
 		}
